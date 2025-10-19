@@ -9,15 +9,15 @@ from playwright.sync_api import sync_playwright, Page, TimeoutError as Playwrigh
 
 # ----------------- 协作常量 -----------------
 TERMINATION_PHRASE = "TASK_COMPLETED_SUCCESSFULLY" 
-RECOVERY_MESSAGE = "Due to a technical issue, this session may have timed out. Please resend your last message." 
-START_CMD_MSG = "Please start the dual-encoding collaboration process and begin your coordination task." 
+RECOVERY_MESSAGE = "Due to a technical issue, this session may have timed out. Please resend your last message."
+START_CMD_MSG = "Please start the dual-encoding collaboration process and begin your coordination task."
 SAFETY_BUFFER_SEC = 15 
 
 # ----------------- UI 定位器常量 -----------------
 INPUT_SEL = 'role=textbox' 
 HISTORY_SEL = '#chat-history-scroll-container' 
-# 🚨 最终简化定位器：使用最原始且稳定的 CSS 类名 (放弃 data-testid)
-LATEST_MSG_SEL = '.user-query-message, .model-response-message'
+# 🚨 【已修改】使用更通用的父级 Class，确保能选中所有消息
+LATEST_MSG_SEL = '.message-content'
 # 兼容中文和英文的停止按钮
 DONE_STATUS_SEL = 'button[aria-label="停止回复"], button[aria-label="Stop responding"]' 
 # ----------------------------------------------------------------------------
@@ -37,7 +37,7 @@ def wait_for_page_stability(page: Page, agent_name: str):
     """等待页面稳定：直接等待核心输入框出现。"""
     TIMEOUT_MS = 30000 
     log("INFO", f"等待 {agent_name} 页面稳定 (输入框, 超时 {TIMEOUT_MS//1000}s)...", "PAGE_WAIT")
-    
+   
     try:
         # 直接等待输入框出现
         page.locator(INPUT_SEL).wait_for(timeout=TIMEOUT_MS)
@@ -359,6 +359,7 @@ if __name__ == '__main__':
             page_A.bring_to_front()
             log("SUCCESS", "Agent A (Edge Page 1) 启动成功。", "SETUP")
 
+            
             # 增加延迟，确保第一个页面完全稳定
             time.sleep(5) 
 
