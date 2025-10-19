@@ -1,0 +1,421 @@
+import time
+import sys
+import os
+from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
+
+# ====================================================================
+# === I. 阶段零：前置依赖与全局常量规范 (FINAL LOCATORS) ===
+# ====================================================================
+
+# ----------------- 协作常量 -----------------
+TERMINATION_PHRASE = "TASK_COMPLETED_SUCCESSFULLY" 
+RECOVERY_MESSAGE = "Due to a technical issue, this session may have timed out. Please resend your last message." 
+START_CMD_MSG = "Please start the dual-encoding collaboration process and begin your coordination task." 
+SAFETY_BUFFER_SEC = 15 
+
+# ----------------- UI 定位器常量 -----------------
+INPUT_SEL = 'role=textbox' 
+HISTORY_SEL = '#chat-history-scroll-container' 
+# 🚨 最终简化定位器：使用最原始且稳定的 CSS 类名 (放弃 data-testid)
+LATEST_MSG_SEL = '.user-query-message, .model-response-message'
+# 兼容中文和英文的停止按钮
+DONE_STATUS_SEL = 'button[aria-label="停止回复"], button[aria-label="Stop responding"]' 
+# ----------------------------------------------------------------------------
+
+# 定义一个简化的日志函数
+def log(level: str, message: str, step: str = "ORCHESTRATOR"):
+    """记录带有时间戳、级别和步骤信息的日志。"""
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}][{level:<5}][{step:<15}] {message}")
+
+def step_log(message: str, agent_name: str):
+    """用于设置阶段的详细步骤跟踪日志。"""
+    log("TRACE", message, agent_name)
+
+# --- 核心辅助函数：页面稳定检查 ---
+def wait_for_page_stability(page: Page, agent_name: str):
+    """等待页面稳定：直接等待核心输入框出现。"""
+    TIMEOUT_MS = 30000 
+    log("INFO", f"等待 {agent_name} 页面稳定 (输入框, 超时 {TIMEOUT_MS//1000}s)...", "PAGE_WAIT")
+    
+    try:
+        # 直接等待输入框出现
+        page.locator(INPUT_SEL).wait_for(timeout=TIMEOUT_MS)
+        log("SUCCESS", f"{agent_name} 核心输入框可见。", "PAGE_WAIT")
+        step_log(f"{agent_name} 页面已准备好接受输入。", "SETUP")
+    except PlaywrightTimeoutError:
+        log("FATAL", f"{agent_name} 页面稳定失败 (未找到核心输入框)。", "PAGE_WAIT")
+        raise Exception("页面初始化失败，无法继续。")
+
+
+# === II. 阶段一：鲁棒性封装函数（核心逻辑） ===
+
+def handle_termination(final_message: str):
+    """终止与交付（硬停止）。"""
+    log("FATAL", "终止信号已发现。程序执行硬停止。", "TERMINATION")
+    log("INFO", f"Agent A 的最终消息内容:\n---\n{final_message}\n---", "TERMINATION")
+    log("INFO", "请检查浏览器窗口获取最终结果。脚本不会关闭浏览器。", "TERMINATION")
+    sys.exit(0)
+
+
+def send_message_robust(page: Page, message: str, current_len_of_target: int, is_target_A: bool) -> int:
+    """1. 确保消息提交成功，并对消息气泡的出现进行双重验证 (安全模式，无 Eval)。"""
+    agent_name = "Agent A" if is_target_A else "Agent B"
+    
+    log("INFO", f"尝试聚焦并发送消息给 {agent_name}. 长度: {len(message)}", "SEND_ROBUST")
+    
+    try:
+        page.bring_to_front()
+        
+        input_locator = page.locator(INPUT_SEL)
+        input_locator.fill(message)
+        input_locator.press("Enter")
+        log("INFO", f"消息已发送给 {agent_name}.", "SEND_ROBUST")
+        
+        # 校验 1：修复 'state="empty"' 兼容性问题，改用循环检查输入值
+        start_time = time.time()
+        max_wait = 5.0  # 5秒等待输入框清空
+        is_cleared = False
+        
+        while time.time() - start_time < max_wait:
+            time.sleep(0.2)
+            # 使用 inner_text() 或 input_value() 检查是否为空
+            try:
+                if not input_locator.inner_text().strip():
+                    is_cleared = True
+                    break
+            except Exception:
+                # 忽略报错，继续等待
+                pass
+        
+        if is_cleared:
+             log("SUCCESS", "输入框已清空 (提交确认).", "SEND_ROBUST")
+        else:
+             log("WARN", "输入框未清空！继续气泡检查。", "SEND_ROBUST")
+
+
+        # 校验 2：等待新的用户气泡出现 (安全模式，避免 EvalError)
+        start_wait_time = time.time()
+        timeout = 30 # 延长超时时间到 30 秒
+        new_len = current_len_of_target
+        
+        while time.time() - start_wait_time < timeout:
+            time.sleep(0.5)
+            new_len = page.locator(LATEST_MSG_SEL).count()
+            if new_len > current_len_of_target:
+                break
+        
+        if new_len <= current_len_of_target:
+            log("FATAL", f"消息已发送，但在 {timeout}s 后未出现气泡。", "SEND_ROBUST")
+            # 🚨 致命错误：气泡未能出现，可能是定位器错误或 Edge 安全限制
+            raise Exception("消息提交失败，气泡数量未增加。")
+            
+        # 修正日志：明确说明历史记录条数是从哪个数字增加到哪个数字
+        log("SUCCESS", f"气泡校验成功. 历史条数: {current_len_of_target} -> {new_len}", "SEND_ROBUST")
+        
+        return new_len
+
+    except Exception as e:
+        log("FATAL", f"发送消息给 {agent_name} 发生致命错误: {e}", "SEND_ROBUST")
+        raise
+
+
+def get_latest_message_safe(page: Page, is_agent_A: bool):
+    """
+    2. 执行“先等后取”，保证提取的是 AI 完成生成后的完整文本。
+    """
+    agent_name = "Agent A" if is_agent_A else "Agent B"
+    
+    log("INFO", f"等待 {agent_name} 完成生成。", "GET_SAFE")
+    try:
+        # 等待停止按钮消失 (60s 超时)
+        page.locator(DONE_STATUS_SEL).wait_for(state="hidden", timeout=60000)
+        log("SUCCESS", f"{agent_name} 生成标记消失。", "GET_SAFE")
+    except PlaywrightTimeoutError:
+        log("WARN", f"{agent_name} 生成标记未消失 (超过 60s)。强制提取。", "GET_SAFE")
+
+    # 提取文本并更新历史长度
+    try:
+        latest_message_locator = page.locator(LATEST_MSG_SEL).last
+        # 等待元素可见，确保文本渲染完成
+        latest_message_locator.wait_for(timeout=10000)
+        
+        message_text = latest_message_locator.inner_text().strip()
+        new_len = page.locator(LATEST_MSG_SEL).count() 
+        
+        log("SUCCESS", f"{agent_name} 消息提取成功. 新历史条数: {new_len}", "GET_SAFE")
+        return message_text, new_len
+        
+    except Exception as e:
+        log("FATAL", f"无法从 {agent_name} 提取最新消息: {e}", "GET_SAFE")
+        raise Exception("无法从 UI 提取最新消息。")
+
+
+def wait_for_response_loop(page: Page, current_len: int, is_agent_A: bool):
+    """3. 鲁棒性等待回复。主等待时间增加到 180 秒，以应对长回复。"""
+    agent_name = "Agent A" if is_agent_A else "Agent B"
+    start_time = time.time()
+    last_path_a_check = start_time
+    
+    TIMEOUT_LOOP_SEC = 180 # 延长到 3 分钟
+    
+    log("INFO", f"开始等待 {agent_name} 回复. 预期历史长度 > {current_len}", "WAIT_LOOP")
+
+    while (time.time() - start_time) < TIMEOUT_LOOP_SEC: 
+        time.sleep(1) # 每秒检查一次
+
+        current_time = time.time()
+        # 内部检测：发现新消息，立即返回
+        new_len = page.locator(LATEST_MSG_SEL).count()
+        if new_len > current_len:
+            elapsed = current_time - start_time
+            log("SUCCESS", f"{agent_name} 回复收到，耗时: {elapsed:.2f}s.", "WAIT_LOOP")
+            return new_len
+
+        # 路径 A 恢复 (每 10 秒检查一次提交卡顿)
+        if (current_time - last_path_a_check) >= 10:
+            last_path_a_check = current_time
+            
+            input_locator = page.locator(INPUT_SEL)
+            
+            try:
+                # 检查输入框是否有内容 (即上次发送可能卡住了)
+                if input_locator.inner_text().strip():
+                    log("WARN", f"路径 A 触发重试: {agent_name} 输入框仍有文本. 尝试重发 Enter.", "WAIT_LOOP")
+                    input_locator.press("Enter")
+            except Exception as e:
+                # 兼容性检查，如果定位器报错，我们跳过它
+                log("INFO", f"路径 A 检查跳过 (无法获取输入值): {e}", "WAIT_LOOP")
+                pass 
+
+
+    # --- 180 秒超时触发 ---
+    log("WARN", f"{TIMEOUT_LOOP_SEC}s 超时！ {agent_name} 未在规定时间内回复.", "WAIT_LOOP")
+    
+    # 安全缓冲检查
+    log("INFO", f"进入 {SAFETY_BUFFER_SEC}s 安全缓冲等待期.", "WAIT_LOOP")
+    buffer_start_time = time.time()
+    while (time.time() - buffer_start_time) < SAFETY_BUFFER_SEC:
+        time.sleep(1)
+        new_len = page.locator(LATEST_MSG_SEL).count()
+        if new_len > current_len:
+            elapsed = time.time() - start_time
+            log("SUCCESS", f"慢速生成被捕获! {agent_name} 在缓冲期回复，总耗时: {elapsed:.2f}s.", "WAIT_LOOP")
+            return new_len
+            
+    log("WARN", "安全缓冲期结束，未发现新消息.", "WAIT_LOOP")
+
+    # 路径 B 恢复 (发送恢复指令)
+    try:
+        page.bring_to_front()
+        log("WARN", "路径 B (生成卡住): 尝试发送恢复指令.", "WAIT_LOOP")
+        
+        # 1. 尝试中止
+        page.keyboard.press("Escape") 
+
+        # 2. 发送恢复指令
+        input_locator = page.locator(INPUT_SEL)
+        input_locator.fill(RECOVERY_MESSAGE)
+        input_locator.press("Enter")
+        log("SUCCESS", "恢复指令已发送. 重置计时器，继续等待.", "WAIT_LOOP")
+        
+        # 重新启动 180s 计时器，并从循环起点继续等待 (递归调用)
+        return wait_for_response_loop(page, current_len, is_agent_A) 
+
+    except Exception as e:
+        log("FATAL", f"路径 B 恢复失败: 无法发送恢复指令: {e}", "WAIT_LOOP")
+        raise
+
+
+# === III. 阶段二：主程序逻辑（Orchestrator 循环） ===
+
+def run_orchestrator(page_A: Page, page_B: Page, len_A: int, len_B: int):
+    """主程序入口，包含启动逻辑和核心协作循环。"""
+    log("INFO", "=== 脚本启动：执行启动逻辑检查 ===", "MAIN")
+
+    # 1. 启动时获取 A 的最终历史长度 (这是你手动操作后的结果)
+    current_len_A = page_A.locator(LATEST_MSG_SEL).count()
+    current_len_B = page_B.locator(LATEST_MSG_SEL).count()
+    
+    log("INFO", f"最终测量的初始历史记录. A: {current_len_A}, B: {current_len_B}", "MAIN_START")
+
+    # 2. 检查 Agent A 是否已有初始任务和回复
+    if current_len_A == 0: 
+        # A 历史记录为空白，需要发送启动指令
+        log("WARN", "Agent A 历史记录为空白。发送启动指令.", "MAIN_START")
+        
+        len_A = send_message_robust(page_A, START_CMD_MSG, current_len_A, True)
+    else:
+        # A 历史记录不为空 (len_A >= 1)，意味着你已经设置了初始任务。
+        log("INFO", f"检测到 Agent A 历史记录 ({current_len_A} 条消息)。开始初始任务处理.", "MAIN_START")
+        
+        # A 的情况：用户发送了奇数条（例如1, 3, 5），AI回复了偶数条（例如2, 4, 6）。
+        if current_len_A % 2 == 0 and current_len_A >= 2:
+            # 偶数条：最新一条是 AI 回复，需要转发
+            log("INFO", "最新消息是 A 的回复。准备转发给 Agent B.", "A_TURN_INIT")
+            
+            # 提取 AI 的最新回复 (即初始计划)
+            message_A, len_A_new = get_latest_message_safe(page_A, True) 
+            
+            # A3. A → B 转发消息
+            log("INFO", "A3. 转发 Agent A 的初始计划给 Agent B.", "A_TURN_INIT")
+            len_B = send_message_robust(page_B, message_A, current_len_B, False)
+
+            # 流程已启动，更新 len_A 和 len_B 为当前值，并进入主循环等待 B 回复
+            len_A = current_len_A
+            len_B = len_B 
+            
+        else:
+            # 奇数条：最新一条是你的输入，脚本需要等待 A 的回复
+            log("INFO", "最新消息是用户输入。进入循环等待 Agent A 的回复.", "MAIN_START")
+            len_A = current_len_A
+            len_B = current_len_B 
+
+
+    # 如果是空白启动， len_A 已经通过 send_message_robust 更新了。
+    if current_len_A == 0:
+        len_B = current_len_B
+    
+    # --- 主循环（Orchestrator Cycle） ---
+    while True:
+        log("=" * 40, "CYCLE_START", "ORCHESTRATOR")
+
+        # --- A1/A2. Agent A (协调者) 回复处理 ---
+        log("INFO", f"A1. 等待 Agent A 的回复 (当前计数: {len_A})", "A_TURN")
+        len_A = wait_for_response_loop(page_A, len_A, True)
+        
+        log("INFO", "A2. 提取 Agent A 的消息.", "A_TURN")
+        message_A, len_A = get_latest_message_safe(page_A, True) 
+
+        # A2 Check. 终止检查
+        if TERMINATION_PHRASE in message_A:
+            handle_termination(message_A)
+        
+        # --- A3. A → B 转发消息 ---
+        log("INFO", f"A3. 转发消息 A → B.", "A_TURN")
+        len_B = send_message_robust(page_B, message_A, len_B, False)
+
+        log("-" * 40, "CYCLE_MIDDLE", "ORCHESTRATOR")
+
+        # --- B1/B2. Agent B (执行者) 回复处理 ---
+        log("INFO", f"B1. 等待 Agent B 的回复 (当前计数: {len_B})", "B_TURN")
+        len_B = wait_for_response_loop(page_B, len_B, False)
+
+        log("INFO", "B2. 提取 Agent B 的消息.", "B_TURN")
+        message_B, len_B = get_latest_message_safe(page_B, False)
+
+        # --- B3. B → A 转发消息 ---
+        log("INFO", f"B3. 转发消息 B → A.", "A_TURN")
+        len_A = send_message_robust(page_A, message_B, len_A, True)
+        
+        log("=" * 40, "CYCLE_END", "ORCHESTRATOR")
+
+
+# --- 示例运行块（Playwright 初始化和启动） ---
+if __name__ == '__main__':
+    # 🚨 使用您的个人 Edge 配置，避免风控和登录。
+    # 路径来源于您的截图：C:\Users\asus\AppData\Local\Microsoft\Edge\User Data
+    EDGE_USER_DATA_PATH = "C:\\Users\\asus\\AppData\\Local\\Microsoft\\Edge\\User Data" 
+    
+    # 🚨 使用用户提供的专属 URL 🚨
+    GEMINI_URL_A = "https://gemini.google.com/u/1/app?hl=zh-cn"
+    GEMINI_URL_B = "https://gemini.google.com/u/3/app?hl=zh-cn"
+    
+    # 在主函数外部定义变量，用于传递给 run_orchestrator
+    page_A, page_B = None, None
+    initial_len_A, initial_len_B = 0, 0
+    context = None # 声明 context 变量 
+
+    # --- 1. 浏览器启动和 Page 创建 (Edge - 单进程双 Page) ---
+    with sync_playwright() as p:
+        try:
+            # 1.1 启动 Edge 浏览器 (持久化模式，使用您的个人数据)
+            log("INFO", "启动 Edge 浏览器 (持久化模式，使用您的个人数据)...", "SETUP")
+
+            # 启动 Edge, 强制使用您的 Edge 用户数据目录 (Persistent Context)
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=EDGE_USER_DATA_PATH,
+                headless=False,
+                channel="msedge", # 强制使用 Edge 浏览器
+                slow_mo=100,
+            )
+            
+            # 1.2 Agent A: 使用现有上下文创建第一个 Page (标签页)
+            log("INFO", "创建 Agent A (第一个标签页)...", "SETUP")
+            # Persistent context 默认会启动一个空白页，我们使用 context.pages[0] 来接管它
+            if not context.pages or context.pages[0].url != 'about:blank':
+                page_A = context.new_page()
+            else:
+                page_A = context.pages[0]
+
+            # 延迟确保 Page 对象完全就绪
+            time.sleep(1) 
+            
+            # 关键调整：使用 'domcontentloaded' 模式，避免 Edge 个人配置的网络冲突
+            page_A.goto(GEMINI_URL_A, wait_until="domcontentloaded", timeout=90000) 
+            
+            wait_for_page_stability(page_A, "Agent A")
+            
+            page_A.bring_to_front()
+            log("SUCCESS", "Agent A (Edge Page 1) 启动成功。", "SETUP")
+
+            # 增加延迟，确保第一个页面完全稳定
+            time.sleep(5) 
+
+            # 1.3 Agent B: 在同一浏览器中创建第二个 Page (标签页)
+            log("INFO", "创建 Agent B (第二个标签页)...", "SETUP")
+            page_B = context.new_page() 
+            
+            # 延迟确保 Page 对象完全就绪
+            time.sleep(1) 
+            
+            # 关键调整：使用 'domcontentloaded' 模式，避免 Edge 个人配置的网络冲突
+            page_B.goto(GEMINI_URL_B, wait_until="domcontentloaded", timeout=90000) 
+
+            wait_for_page_stability(page_B, "Agent B")
+
+            page_B.bring_to_front()
+            
+            log("SUCCESS", "双 Page (您的 Edge) 已启动。", "SETUP")
+
+
+            # --- 2. 手动操作窗口期 ---
+            log("WARN", "提示：脚本正在使用您的 Edge 个人配置 (零登录状态)。", "MANUAL_STEP")
+            MANUAL_SETUP_TIME = 90 
+            log("WARN", f"请在 {MANUAL_SETUP_TIME} 秒内完成初始任务发送（发送给 Agent A 标签页）。", "MANUAL_STEP")
+            log("WARN", f"提示：Agent A 是第一个标签页，URL: {GEMINI_URL_A}", "MANUAL_STEP")
+            log("WARN", f"提示：Agent B 是第二个标签页，URL: {GEMINI_URL_B}", "MANUAL_STEP")
+            
+            time.sleep(MANUAL_SETUP_TIME) 
+            
+            # 🚨 关键修复：延迟获取历史长度，确保浏览器渲染完手动操作后的回复
+            log("INFO", "等待 5 秒，确保浏览器渲染完手动操作后的回复...", "SETUP")
+            time.sleep(5) 
+
+            # --- 3. 获取初始状态并运行 ---
+            try:
+                # 3.1 尝试获取初始历史长度 (使用精确计数)
+                initial_len_A = page_A.locator(LATEST_MSG_SEL).count()
+                initial_len_B = page_B.locator(LATEST_MSG_SEL).count()
+                log("INFO", f"初始历史记录数量获取完成。A: {initial_len_A}, B: {initial_len_B}", "SETUP")
+
+                # 3.2 调用 Orchestrator 主循环
+                run_orchestrator(
+                    page_A=page_A, 
+                    page_B=page_B, 
+                    len_A=initial_len_A, 
+                    len_B=initial_len_B
+                )
+                
+            except Exception as e:
+                log("FATAL", f"Orchestrator 流程退出或初始化失败: {e}", "MAIN_EXIT")
+            finally:
+                log("INFO", "脚本已退出。浏览器保持开启开启状态，请手动检查。", "MAIN_EXIT")
+                # 关闭 context 实例
+                if context:
+                    context.close()
+                time.sleep(5) 
+
+        except Exception as e:
+            log("FATAL", f"Playwright 初始化或浏览器启动失败: {e}", "SETUP_FATAL")
+            sys.exit(1)
